@@ -1,6 +1,9 @@
-name: Stage Keyglass v1 mirror
+name: Mirror Keyglass v1 updater
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
 
 permissions: {}
 
@@ -10,30 +13,60 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Copy the live v1 update site
-        run: bash scripts/snapshot-updater.sh https://scott-meyer.github.io/openflux site/openflux
+      - name: Copy the canonical Keyglass update site
+        run: bash scripts/snapshot-updater.sh https://keyglass-dev.github.io/keyglass site/openflux
       - name: Verify the copied update index with the v1 release key
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq install minisign
           minisign -Vm site/openflux/index.json -x site/openflux/index.json.sig -p keys/v1-release.pub
-      - name: Stage a preview outside the existing project Pages path
+      - name: Check for rollback or an unchanged scheduled snapshot
+        id: check
         run: |
-          cp -R site/openflux site/keyglass-mirror-check
+          legacy=https://scott-meyer.github.io/openflux
+          fresh="mirror=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          status=$(curl -sS --max-time 30 -o live-index.json -w '%{http_code}' "$legacy/index.json?$fresh")
+          candidate=$(jq -er '.sequence | select(type == "number" and floor == . and . >= 10)' site/openflux/index.json)
+          case "$status" in
+            200)
+              previous=$(jq -er '.sequence | select(type == "number" and floor == . and . >= 10)' live-index.json)
+              if (( candidate < previous )) || { (( candidate == previous )) && ! cmp -s live-index.json site/openflux/index.json; }; then
+                echo "Refusing to replace legacy sequence $previous with candidate $candidate" >&2
+                exit 1
+              fi
+              if [[ "$GITHUB_EVENT_NAME" == schedule ]] && (( candidate == previous )) &&
+                  curl -fsS --max-time 30 "$legacy/site-manifest.json?$fresh" -o live-manifest.json &&
+                  cmp -s live-manifest.json site/openflux/site-manifest.json; then
+                echo "Legacy mirror already serves signed sequence $candidate"
+                echo 'publish=false' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            404) echo "Restoring the legacy site from signed sequence $candidate" ;;
+            *) echo "Cannot read the current legacy update index (HTTP $status)" >&2; exit 1 ;;
+          esac
+          echo 'publish=true' >> "$GITHUB_OUTPUT"
+      - name: Prepare the Pages root
+        if: steps.check.outputs.publish == 'true'
+        run: |
           cp index.html site/
           touch site/.nojekyll
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.1
+      - if: steps.check.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.1
         with:
           path: site
 
   deploy:
     needs: snapshot
+    if: needs.snapshot.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
       pages: write
